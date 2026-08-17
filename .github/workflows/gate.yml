@@ -1,0 +1,208 @@
+name: OIDC provenance gate
+
+# Reusable gate. Derives the provenance of the job that called it and verifies it
+# against sources outside the calling repository.
+#
+# Takes NO verdict as input, by design. A caller cannot be trusted to describe
+# its own execution: anything it writes about itself is written by the party
+# whose claim is in question. Every fact below is computed here.
+#
+# Fails the job on any violation. A missing claim, an unreachable API or an empty
+# result is INCONCLUSIVE, never a pass.
+
+on:
+  workflow_call:
+    inputs:
+      audience:
+        description: Audience to request in the OIDC token. Not a verdict.
+        required: true
+        type: string
+    outputs:
+      verified:
+        description: Derived here, never accepted from the caller.
+        value: ${{ jobs.gate.outputs.verified }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      verified: ${{ steps.verificar.outputs.verified }}
+    steps:
+      - name: Write the signature verifier
+        shell: bash
+        run: |
+          # Kept as a file, indented inside this block, because a here-document
+          # flush against column zero terminates the YAML block scalar.
+          cat > /tmp/verify_jwt.py <<'PY'
+          import json, os, sys
+          try:
+              import jwt
+              from jwt import PyJWKSet
+          except Exception:
+              print("INCONCLUSIVE:pyjwt-missing"); sys.exit(0)
+
+          tok = open("/tmp/tok.jwt").read().strip()
+          jwks = PyJWKSet.from_dict(json.load(open("/tmp/jwks.json")))
+          hdr = jwt.get_unverified_header(tok)
+
+          key = None
+          for k in jwks.keys:
+              if k.key_id == hdr.get("kid"):
+                  key = k.key
+                  break
+          if key is None:
+              print("FAIL:kid-not-in-jwks"); sys.exit(0)
+
+          try:
+              jwt.decode(tok, key=key, algorithms=[hdr["alg"]],
+                         audience=os.environ["AUD"], issuer=os.environ["ISS"])
+              print("OK")
+          except Exception as e:
+              print("FAIL:" + type(e).__name__)
+          PY
+          python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography
+
+      - name: Derive and verify provenance
+        id: verificar
+        shell: bash
+        env:
+          AUDIENCIA: ${{ inputs.audience }}
+        run: |
+          set -uo pipefail
+
+          falhas=()
+          nota() { falhas+=("$1"); }
+          inconclusivo() {
+            echo "INCONCLUSIVE: $1"
+            echo "verified=inconclusive" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+          # This workflow never hard-codes which repository it lives in. Doing so
+          # would be a claim; reading it from a platform-set claim is a
+          # measurement. `github.repository` here is the CALLER, not the gate.
+
+          [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || inconclusivo "no OIDC endpoint in this environment"
+
+          tok=$(curl -sS --fail-with-body \
+                -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCIA}" \
+                | jq -r '.value // empty') || true
+          [ -n "$tok" ] || inconclusivo "token request failed"
+
+          # The token is never printed. Only derived facts leave this job.
+          claims=$(printf '%s' "$tok" | jq -R 'split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson')
+          hdr=$(printf '%s' "$tok" | jq -R 'split(".")[0] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson')
+          g() { printf '%s' "$claims" | jq -r --arg k "$1" '.[$k] // empty'; }
+
+          iss=$(g iss); aud=$(g aud); exp=$(g exp); iat=$(g iat)
+          jwr=$(g job_workflow_ref); jws=$(g job_workflow_sha)
+          wfr=$(g workflow_ref); runid=$(g run_id); att=$(g run_attempt)
+          env_run=$(g runner_environment)
+          kid=$(printf '%s' "$hdr" | jq -r '.kid // empty')
+          alg=$(printf '%s' "$hdr" | jq -r '.alg // empty')
+
+          # --- 1. signature against the issuer's published JWKS ---------------
+          # No credential involved. The keys live outside every repository.
+          [ -n "$iss" ] || inconclusivo "token has no issuer"
+          jwks_uri=$(curl -sS --fail-with-body "${iss}/.well-known/openid-configuration" | jq -r '.jwks_uri // empty') || true
+          [ -n "$jwks_uri" ] || inconclusivo "issuer discovery unreachable"
+          curl -sS --fail-with-body "$jwks_uri" > /tmp/jwks.json || inconclusivo "JWKS unreachable"
+          [ -s /tmp/jwks.json ] || inconclusivo "JWKS empty"
+
+          umask 077
+          printf '%s' "$tok" > /tmp/tok.jwt
+          sig=$(AUD="$AUDIENCIA" ISS="$iss" python3 /tmp/verify_jwt.py)
+          shred -u /tmp/tok.jwt 2>/dev/null || rm -f /tmp/tok.jwt
+          case "$sig" in
+            OK) ;;
+            INCONCLUSIVE:*) inconclusivo "signature verifier unavailable (${sig})" ;;
+            *) nota "signature, audience or issuer rejected (${sig})" ;;
+          esac
+
+          # --- 2. job_workflow_ref must name THIS workflow --------------------
+          gate_path=".github/workflows/gate.yml"
+          case "$jwr" in
+            */"$gate_path"@*) ;;
+            *) nota "job_workflow_ref does not name this workflow" ;;
+          esac
+          gate_repo="${jwr%%/.github/*}"
+          [ -n "$gate_repo" ] || nota "cannot derive the gate repository from job_workflow_ref"
+
+          # --- 3. the call must pin an immutable commit ----------------------
+          jwr_ref="${jwr##*@}"
+          if printf '%s' "$jwr_ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            pinned=yes
+          else
+            pinned=no
+            nota "called through a moving reference ('${jwr_ref}'), not an immutable commit"
+          fi
+          [ -n "$jws" ] || nota "job_workflow_sha absent"
+          if [ "$pinned" = yes ] && [ -n "$jws" ] && [ "$jwr_ref" != "$jws" ]; then
+            nota "the pinned ref and job_workflow_sha disagree"
+          fi
+
+          # --- 4. the commit must belong to the protected default branch ------
+          # Independent source: the gate repository's PUBLIC API, no credential.
+          api="https://api.github.com/repos/${gate_repo}"
+          branch=$(curl -sS --fail-with-body "$api" | jq -r '.default_branch // empty') || true
+          [ -n "$branch" ] || inconclusivo "gate repository API unreachable"
+          protegida=$(curl -sS --fail-with-body "${api}/branches/${branch}" | jq -r '.protected // empty') || true
+          [ -n "$protegida" ] || inconclusivo "branch API unreachable"
+          [ "$protegida" = "true" ] || nota "the gate default branch is not protected"
+
+          # Ancestry, not equality: an approved commit may be older than the tip.
+          cmp=$(curl -sS --fail-with-body "${api}/compare/${jws}...${branch}" | jq -r '.status // empty') || true
+          [ -n "$cmp" ] || inconclusivo "ancestry comparison unreachable"
+          case "$cmp" in
+            identical|behind) ;;
+            *) nota "job_workflow_sha is not in the history of the protected branch (compare=${cmp})" ;;
+          esac
+
+          # --- 5. validity window, audience and run identity -----------------
+          agora=$(date -u +%s)
+          if [ -z "$exp" ] || [ -z "$iat" ]; then
+            nota "the token has no validity window"
+          else
+            [ "$agora" -lt "$exp" ] || nota "token expired"
+            [ "$agora" -ge $((iat - 60)) ] || nota "token issued in the future"
+          fi
+          [ "$aud" = "$AUDIENCIA" ] || nota "audience mismatch"
+          [ "$env_run" = "github-hosted" ] || nota "runner environment is '${env_run}'"
+          { [ -n "$runid" ] && [ -n "$att" ]; } || nota "run identity incomplete"
+
+          # --- derived facts, sanitized --------------------------------------
+          echo "--- derived (no token, no authenticable material) ---"
+          echo "  gate repository     : ${gate_repo}"
+          echo "  gate workflow       : ${gate_path}"
+          echo "  pinned to a commit  : ${pinned}"
+          echo "  job_workflow_sha    : ${jws:0:12}"
+          echo "  ref in job_workflow : ${jwr_ref:0:12}"
+          echo "  protected branch    : ${branch} (protected=${protegida})"
+          echo "  ancestry vs branch  : ${cmp}"
+          echo "  signature           : ${sig}"
+          echo "  algorithm / key id  : ${alg} / ${kid:0:8}"
+          echo "  audience matched    : $([ "$aud" = "$AUDIENCIA" ] && echo yes || echo NO)"
+          if [ -n "$exp" ] && [ -n "$iat" ]; then
+            echo "  window (s)          : $((exp - iat)), remaining $((exp - agora))"
+          fi
+          echo "  caller run          : ${runid} attempt ${att}"
+          echo "  caller workflow file: ${wfr##*/}"
+          echo "  caller repository   : (not printed)"
+          echo "  runner environment  : ${env_run}"
+
+          if [ ${#falhas[@]} -gt 0 ]; then
+            echo ""
+            echo "REJECTED:"
+            for f in "${falhas[@]}"; do echo "  - ${f}"; done
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo ""
+          echo "VERIFIED: provenance derived here, confirmed against the issuer's published"
+          echo "          keys and this repository's public protected history."
+          echo "verified=true" >> "$GITHUB_OUTPUT"
