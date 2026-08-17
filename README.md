@@ -55,3 +55,5 @@ issuer, and `job_workflow_ref`/`job_workflow_sha` are set by the platform, not b
 It does **not** protect against someone who administers the repositories involved. Anyone able to
 change this repository's protected branch, or to change how the caller consumes the result, is
 outside the guarantee. That is a governance problem, not something a workflow can solve.
+
+<!-- probe: commit deliberately outside the protected history -->
