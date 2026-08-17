@@ -156,10 +156,18 @@ jobs:
           [ "$protegida" = "true" ] || nota "the gate default branch is not protected"
 
           # Ancestry, not equality: an approved commit may be older than the tip.
+          #
+          # The direction matters and is easy to get backwards. Measured against
+          # this API: for `compare/BASE...HEAD` the status describes HEAD relative
+          # to BASE. With BASE = the commit under test and HEAD = the protected
+          # branch, only `ahead` (the branch has moved on from it) and `identical`
+          # mean the commit is IN that history. `behind` means the branch is
+          # behind the commit, i.e. the commit is a descendant that was never
+          # merged -- exactly the case that must be refused.
           cmp=$(curl -sS --fail-with-body "${api}/compare/${jws}...${branch}" | jq -r '.status // empty') || true
           [ -n "$cmp" ] || inconclusivo "ancestry comparison unreachable"
           case "$cmp" in
-            identical|behind) ;;
+            identical|ahead) ;;
             *) nota "job_workflow_sha is not in the history of the protected branch (compare=${cmp})" ;;
           esac
 
