@@ -3,31 +3,30 @@ name: OIDC provenance gate
 # Reusable gate. Derives the provenance of the job that called it and verifies
 # it against sources outside the calling repository.
 #
-# ROOT OF TRUST, AND WHY IT IS HERE AND NOT IN THE TOKEN
+# ROOT OF TRUST: THERE IS NO BOOTSTRAP
 #
 # An earlier version read the repository and commit out of the JWT payload
-# BEFORE verifying its signature, then downloaded a verifier from that location
-# and ran it. Unauthenticated data chose the code that would do the
-# authentication. Even where the happy path holds, the property claimed is that
-# the signature is the root -- so nothing may depend on it before it is proven.
+# BEFORE verifying its signature, fetched a verifier from that location and ran
+# it -- unauthenticated data choosing the code that would do the
+# authentication. The first fix pinned the repository and the verifier digest
+# and fetched from constants. Two measurements then killed that too: neither
+# `github.workflow_sha` nor `github.job_workflow_sha` yields THIS workflow's own
+# commit inside a reusable call. The first describes the caller; the second came
+# back empty. So the gate could not name its own code without asking the token,
+# which is the circularity again.
 #
-# Fixed here instead, in the file that is immutable at the approved commit:
-#
-#   GATE_EXPECTED_REPO   the only repository the verifier may be fetched from
-#   VERIFY_SHA256        the exact bytes of verify.py that may be executed
-#
-# Both are checked before python runs anything. A payload naming another
-# repository or another commit changes neither, so it cannot select code.
+# The verifier is therefore EMBEDDED below. Nothing is fetched and nothing is
+# selected: the code that runs is this file, immutable at the approved commit.
+# tests/bateria.py fails if the embedded bytes differ from verify.py by a single
+# byte, so the readable file and the executed copy cannot drift apart.
 #
 # NO INPUTS. An earlier version took the audience as one, which made the check
 # circular: the caller chose both the value requested and the value compared.
-# The audience is a constant of verify.py; it is duplicated below only to
-# request the token, and verify.py re-checks it against its own constant, so
-# drift can cause a rejection and never a false pass.
 #
-# NO RUN-TIME DEPENDENCY INSTALL. verify.py implements RS256 against the
-# standard library. Pinning a commit and then installing unpinned cryptography
-# would leave the approved commit verifying with different code tomorrow.
+# NO RUN-TIME DEPENDENCIES. The verifier implements RS256 -- RSASSA-PKCS1-v1_5
+# with SHA-256 -- against the standard library. Pinning a commit and then
+# installing unpinned cryptography would leave the approved commit verifying
+# with different code tomorrow, which is not pinning.
 #
 # Three outcomes: VERIFIED, REJECTED (a rule was broken), INCONCLUSIVE (the
 # verification could not be carried out). An unexpected failure is never a
@@ -52,56 +51,398 @@ jobs:
     env:
       # --- root of trust, fixed in this file ------------------------------
       GATE_EXPECTED_REPO: felipemartinsal-boop/reusable-oidc-gate
-      # sha256 of verify.py at this commit. tests/bateria.py fails if the two
-      # ever drift, so a change to the verifier that forgets this line does not
-      # reach the protected branch.
-      VERIFY_SHA256: c94bfda909b68307efeb0bf59044f834e756bcd1853593e2ad04c7972d478823
-      # Same constant as verify.py:AUDIENCIA_NORMATIVA.
+      # Same constant as the embedded AUDIENCIA_NORMATIVA. Duplicated only to
+      # request the token; the verifier re-checks it, so drift can cause a
+      # rejection and never a false pass.
       AUDIENCIA: reusable-oidc-gate/provenance/v1
-      # The commit of THIS workflow file, set by the platform for the called
-      # workflow. Measured, not assumed: GITHUB_WORKFLOW_SHA describes the
-      # CALLER -- using it made the gate fetch its own verifier at the caller's
-      # commit, which 404s. `github.job_workflow_sha` is the one that describes
-      # the workflow that provided the job. Neither comes from the token.
-      COMMIT_DO_GATE: ${{ github.job_workflow_sha }}
-      COMMIT_DO_CHAMADOR: ${{ github.workflow_sha }}
     steps:
-      - name: Fetch the pinned verifier and check its digest
-        id: fonte
+      - name: Materialise the embedded verifier
         shell: bash
         run: |
           set -uo pipefail
+          # Written from this file, not downloaded. There is no URL to poison
+          # and no digest to fetch, because nothing arrives from outside.
+          cat > /tmp/verify.py <<'FIM_DO_VERIFICADOR'
+          """Decision logic for the OIDC provenance gate.
 
-          inconclusivo() {
-            echo "RESULT=INCONCLUSIVE"
-            echo "REASON=$1"
-            echo "result=INCONCLUSIVE" >> "$GITHUB_OUTPUT"
-            exit 1
-          }
+          No third-party imports. The signature check is RSASSA-PKCS1-v1_5 with SHA-256,
+          written against the standard library, because a provenance root that pins a
+          commit and then installs unpinned cryptography at run time has not pinned
+          anything: the same approved commit would verify with different code tomorrow.
+          Vendoring the forty lines below removes the question instead of answering it.
 
-          # The commit is this workflow's own, reported by the platform for the
-          # workflow file that provided this job. It is NOT taken from the token.
-          sha="${COMMIT_DO_GATE:-}"
-          case "$sha" in
-            ????????????????????????????????????????) ;;
-            *) inconclusivo "the platform did not expose this workflow's own commit" ;;
-          esac
-          echo "  expected repository : ${GATE_EXPECTED_REPO}"
-          echo "  gate commit         : ${sha:0:12}"
-          echo "  caller commit       : ${COMMIT_DO_CHAMADOR:0:12}  (not used to fetch anything)"
+          `decidir` is pure: claims and already-fetched facts in, an outcome out. All I/O
+          lives in `main`.
 
-          # Both halves of this URL are constants of this file. Nothing the
-          # caller or the token says can move it.
-          curl -sS --fail-with-body -o /tmp/verify.py \
-            "https://raw.githubusercontent.com/${GATE_EXPECTED_REPO}/${sha}/verify.py" \
-            || inconclusivo "verifier source unreachable at the pinned commit"
-          [ -s /tmp/verify.py ] || inconclusivo "verifier source empty"
+          Three outcomes, and the distinction is the point:
 
-          obtido=$(sha256sum /tmp/verify.py | cut -d' ' -f1)
-          echo "  verifier digest     : ${obtido:0:12}"
-          if [ "$obtido" != "$VERIFY_SHA256" ]; then
-            inconclusivo "verifier digest does not match the one pinned in this workflow"
-          fi
+              VERIFIED      every rule held
+              REJECTED      a rule was broken -- a policy failure, or a proof known to be bad
+              INCONCLUSIVE  the verification could not be carried out: crash, empty key
+                            set, network error, malformed response, anything unexpected
+
+          An unexpected failure is never a rejection. Collapsing the two lets a crash
+          read as "we checked and it was bad", which is a lie with the same shape as the
+          truth.
+          """
+
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          import hmac
+          import json
+
+          # Normative constant, NOT an input. The caller cannot choose the audience it is
+          # measured against; if it could, the check would compare a value the caller
+          # picked with a value the caller picked, and confirm only its own consistency.
+          AUDIENCIA_NORMATIVA = "reusable-oidc-gate/provenance/v1"
+
+          EMISSOR_NORMATIVO = "https://token.actions.githubusercontent.com"
+
+          # Normative allowlist. The token header does NOT get to nominate the algorithm
+          # it will be checked with -- that would be the caller choosing the strength of
+          # the check applied to the caller.
+          ALGORITMOS_PERMITIDOS = ("RS256",)
+
+          VERIFIED = "VERIFIED"
+          REJECTED = "REJECTED"
+          INCONCLUSIVE = "INCONCLUSIVE"
+
+          CAMINHO_GATE = ".github/workflows/gate.yml"
+          FICHEIRO_APROVADOS = "approved-shas.json"
+
+          # DER prefix of DigestInfo(SHA-256), RFC 8017 A.2.4.
+          _PREFIXO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+          def b64u(dados):
+              s = dados + "=" * (-len(dados) % 4)
+              return base64.urlsafe_b64decode(s.encode("ascii"))
+
+
+          def _hex40(v):
+              if not isinstance(v, str) or len(v) != 40:
+                  return False
+              return all(c in "0123456789abcdef" for c in v)
+
+
+          # ---------------------------------------------------------- signature, stdlib
+
+          def verificar_assinatura(token, jwks):
+              """(estado, detalhe), estado in {ok, mau, inconclusive}.
+
+              `mau` means the proof is known to be bad. `inconclusive` means it could not
+              be judged: no usable key, unreadable structure, unsupported key type.
+              """
+              if not isinstance(token, str) or token.count(".") != 2:
+                  return "inconclusive", "token is not a three-part JWS"
+              cabeca_b64, carga_b64, assinatura_b64 = token.split(".")
+
+              try:
+                  cabeca = json.loads(b64u(cabeca_b64))
+              except Exception as e:
+                  return "inconclusive", "unreadable header (%s)" % type(e).__name__
+              if not isinstance(cabeca, dict):
+                  return "inconclusive", "header is not an object"
+
+              alg = cabeca.get("alg")
+              if alg not in ALGORITMOS_PERMITIDOS:
+                  # Refused as a POLICY failure, not an inability: a token offering
+                  # `none`, HS256 or RS512 is not unjudgeable -- it is asking to be
+                  # judged differently.
+                  return "mau", "algorithm %r is not in the normative allowlist" % (alg,)
+
+              if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+                  return "inconclusive", "key set is not a JWKS"
+              chaves = jwks["keys"]
+              if not chaves:
+                  return "inconclusive", "key set has no keys"
+
+              kid = cabeca.get("kid")
+              jwk = None
+              for k in chaves:
+                  if isinstance(k, dict) and k.get("kid") == kid:
+                      jwk = k
+                      break
+              if jwk is None:
+                  return "mau", "kid not in key set"
+              if jwk.get("kty") != "RSA":
+                  return "inconclusive", "key type %r unsupported" % jwk.get("kty")
+              if "alg" in jwk and jwk["alg"] not in ALGORITMOS_PERMITIDOS:
+                  return "mau", "key declares algorithm %r" % jwk["alg"]
+
+              try:
+                  n = int.from_bytes(b64u(jwk["n"]), "big")
+                  e = int.from_bytes(b64u(jwk["e"]), "big")
+                  assinatura = b64u(assinatura_b64)
+              except Exception as ex:
+                  return "inconclusive", "key or signature unreadable (%s)" % type(ex).__name__
+              if n <= 0 or e <= 0:
+                  return "inconclusive", "key parameters out of range"
+
+              k = (n.bit_length() + 7) // 8
+              if len(assinatura) != k:
+                  return "mau", "signature length does not match the modulus"
+
+              s = int.from_bytes(assinatura, "big")
+              if s >= n:
+                  return "mau", "signature out of range"
+
+              # RSAVP1, then the EMSA-PKCS1-v1_5 comparison, RFC 8017.
+              m = pow(s, e, n)
+              em = m.to_bytes(k, "big")
+
+              assinado = ("%s.%s" % (cabeca_b64, carga_b64)).encode("ascii")
+              t = _PREFIXO_SHA256 + hashlib.sha256(assinado).digest()
+              if k < len(t) + 11:
+                  return "inconclusive", "modulus too small for this digest"
+              esperado = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+
+              if not hmac.compare_digest(em, esperado):
+                  return "mau", "signature does not verify"
+              return "ok", ""
+
+
+          # ------------------------------------------------------------------- decision
+
+          def decidir(claims, factos, agora):
+              """Return (outcome, [reasons])."""
+              if not isinstance(claims, dict):
+                  return INCONCLUSIVE, ["claims are not an object"]
+              if not isinstance(factos, dict):
+                  return INCONCLUSIVE, ["facts are not an object"]
+
+              # --- infrastructure first: anything unusable here is INCONCLUSIVE --------
+              assinatura = factos.get("assinatura")
+              if assinatura is None:
+                  return INCONCLUSIVE, ["signature verification did not run"]
+              if assinatura == "inconclusive":
+                  return INCONCLUSIVE, ["signature could not be verified: %s"
+                                        % factos.get("assinatura_detalhe", "unknown")]
+
+              aprovados = factos.get("aprovados")
+              if aprovados is None:
+                  return INCONCLUSIVE, ["approved-SHA list unavailable"]
+              if not isinstance(aprovados, list):
+                  return INCONCLUSIVE, ["approved-SHA list is malformed"]
+              if len(aprovados) == 0:
+                  # An empty set is not permission to pass. It is the absence of an answer.
+                  return INCONCLUSIVE, ["approved-SHA list is empty"]
+              if not all(_hex40(x) for x in aprovados):
+                  return INCONCLUSIVE, ["approved-SHA list contains an entry that is not a commit id"]
+
+              # Without this the repository check below would simply not happen, and a
+              # workflow that forgot to fix it would verify tokens naming any repository.
+              # An absent root is not a permissive root: it is the absence of one.
+              if not factos.get("repositorio_esperado"):
+                  return INCONCLUSIVE, ["the workflow did not fix an expected repository"]
+
+              ramo = factos.get("ramo_por_omissao")
+              if not ramo:
+                  return INCONCLUSIVE, ["default branch of the gate repository unknown"]
+              protegido = factos.get("ramo_protegido")
+              if protegido is None:
+                  return INCONCLUSIVE, ["protection state of the default branch unknown"]
+
+              for campo in ("iss", "aud", "exp", "iat", "job_workflow_ref", "job_workflow_sha"):
+                  if campo not in claims:
+                      return INCONCLUSIVE, ["token has no %r claim" % campo]
+
+              try:
+                  exp = int(claims["exp"])
+                  iat = int(claims["iat"])
+                  agora = int(agora)
+              except (TypeError, ValueError):
+                  return INCONCLUSIVE, ["token validity window is not numeric"]
+
+              # --- policy: from here on, a violation is a REJECTION --------------------
+              v = []
+
+              if assinatura != "ok":
+                  v.append("signature rejected (%s)" % factos.get("assinatura_detalhe", assinatura))
+
+              if claims["iss"] != EMISSOR_NORMATIVO:
+                  v.append("issuer is not the normative one")
+
+              # The audience is a constant of this gate. It binds the token to THIS
+              # verifier's purpose; it does NOT bind the caller, prove authorisation, or
+              # say anything about who asked.
+              if claims["aud"] != AUDIENCIA_NORMATIVA:
+                  v.append("audience is not the normative constant")
+
+              if agora >= exp:
+                  v.append("token expired")
+              if agora < iat - 60:
+                  v.append("token issued in the future")
+
+              jwr = claims["job_workflow_ref"]
+              jws = claims["job_workflow_sha"]
+
+              if not isinstance(jwr, str) or ("/%s@" % CAMINHO_GATE) not in jwr:
+                  v.append("job_workflow_ref does not name this workflow")
+
+              ref = jwr.rsplit("@", 1)[-1] if isinstance(jwr, str) and "@" in jwr else ""
+              if not _hex40(ref):
+                  v.append("called through a moving reference (%r), not an immutable commit" % ref)
+              elif ref != jws:
+                  v.append("the pinned ref and job_workflow_sha disagree")
+
+              # The repository must be the one this gate lives in. Supplied by the caller
+              # of `decidir` from a constant fixed in the approved workflow, never read
+              # from the token.
+              prefixo = "%s/%s@" % (factos["repositorio_esperado"], CAMINHO_GATE)
+              if not isinstance(jwr, str) or not jwr.startswith(prefixo):
+                  v.append("job_workflow_ref does not name the expected repository")
+
+              # EXACT PINNING. Belonging to the protected history is necessary and NOT
+              # sufficient: an older commit is in that history too, and an older commit
+              # may carry a weaker gate. Only the commit that was explicitly approved
+              # passes -- ancestry is kept as a second, independent condition.
+              if not _hex40(jws):
+                  v.append("job_workflow_sha is not a commit id")
+              else:
+                  if jws not in aprovados:
+                      v.append("job_workflow_sha is not the approved commit")
+                  if factos.get("na_historia_protegida") is not True:
+                      v.append("job_workflow_sha is not in the history of the protected branch")
+
+              if protegido is not True:
+                  v.append("the gate default branch is not protected")
+
+              if claims.get("runner_environment") != "github-hosted":
+                  v.append("runner environment is not github-hosted")
+              if not claims.get("run_id") or not claims.get("run_attempt"):
+                  v.append("run identity incomplete")
+
+              if v:
+                  return REJECTED, v
+              return VERIFIED, []
+
+
+          # ----------------------------------------------------------------- I/O wrapper
+
+          def _http_json(url):
+              """Fetch JSON with no credential. Returns (dados, erro)."""
+              import urllib.error
+              import urllib.request
+              pedido = urllib.request.Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "reusable-oidc-gate",
+              })
+              try:
+                  with urllib.request.urlopen(pedido, timeout=20) as r:
+                      corpo = r.read()
+              except urllib.error.HTTPError as e:
+                  return None, "HTTP %s" % e.code
+              except Exception as e:
+                  return None, type(e).__name__
+              try:
+                  return json.loads(corpo), None
+              except Exception:
+                  return None, "malformed JSON"
+
+
+          def main():
+              import os
+              import sys
+              import time
+
+              def sair(estado, motivos):
+                  print("RESULT=%s" % estado)
+                  for m in motivos:
+                      print("REASON=%s" % m)
+                  sys.exit(0 if estado == VERIFIED else 1)
+
+              token = os.environ.get("GATE_TOKEN", "")
+              if not token or token.count(".") != 2:
+                  sair(INCONCLUSIVE, ["no usable token in this environment"])
+
+              # The expected repository is fixed by the approved workflow, which is
+              # immutable at the approved commit. It is NOT read from the token: the
+              # token is what is being judged.
+              esperado_repo = os.environ.get("GATE_EXPECTED_REPO", "")
+              if not esperado_repo:
+                  sair(INCONCLUSIVE, ["the workflow did not fix an expected repository"])
+
+              try:
+                  claims = json.loads(b64u(token.split(".")[1]))
+              except Exception as e:
+                  sair(INCONCLUSIVE, ["token payload unreadable (%s)" % type(e).__name__])
+              if not isinstance(claims, dict):
+                  sair(INCONCLUSIVE, ["token payload is not an object"])
+
+              factos = {"repositorio_esperado": esperado_repo}
+
+              cfg, erro = _http_json("%s/.well-known/openid-configuration" % EMISSOR_NORMATIVO)
+              if erro or not isinstance(cfg, dict) or not cfg.get("jwks_uri"):
+                  sair(INCONCLUSIVE, ["issuer discovery unavailable (%s)" % (erro or "no jwks_uri")])
+              jwks, erro = _http_json(cfg["jwks_uri"])
+              if erro or not isinstance(jwks, dict):
+                  sair(INCONCLUSIVE, ["key set unavailable (%s)" % (erro or "malformed")])
+
+              estado, detalhe = verificar_assinatura(token, jwks)
+              factos["assinatura"] = estado
+              factos["assinatura_detalhe"] = detalhe
+
+              # Every network read below is about the EXPECTED repository, fixed by the
+              # workflow. Nothing here is addressed by the token.
+              api = "https://api.github.com/repos/%s" % esperado_repo
+              info, erro = _http_json(api)
+              if erro or not isinstance(info, dict) or not info.get("default_branch"):
+                  sair(INCONCLUSIVE, ["gate repository metadata unavailable (%s)" % (erro or "no default_branch")])
+              ramo = info["default_branch"]
+              factos["ramo_por_omissao"] = ramo
+
+              binfo, erro = _http_json("%s/branches/%s" % (api, ramo))
+              if erro or not isinstance(binfo, dict) or "protected" not in binfo:
+                  sair(INCONCLUSIVE, ["branch protection state unavailable (%s)" % (erro or "no field")])
+              factos["ramo_protegido"] = bool(binfo["protected"])
+
+              jws = claims.get("job_workflow_sha", "")
+              if _hex40(jws):
+                  cmp_, erro = _http_json("%s/compare/%s...%s" % (api, jws, ramo))
+                  if erro or not isinstance(cmp_, dict) or not cmp_.get("status"):
+                      sair(INCONCLUSIVE, ["ancestry comparison unavailable (%s)" % (erro or "no status")])
+                  # `ahead` = the branch moved on from this commit; `identical` = it is the
+                  # tip. Both place it inside that history. `behind`/`diverged` do not.
+                  factos["na_historia_protegida"] = cmp_["status"] in ("identical", "ahead")
+              else:
+                  factos["na_historia_protegida"] = False
+
+              # Read from the PROTECTED branch, so changing it needs the same review that
+              # protects the gate itself.
+              conteudo, erro = _http_json("%s/contents/%s?ref=%s" % (api, FICHEIRO_APROVADOS, ramo))
+              if erro or not isinstance(conteudo, dict) or not conteudo.get("content"):
+                  sair(INCONCLUSIVE, ["approved-SHA list unavailable (%s)" % (erro or "no content")])
+              try:
+                  doc = json.loads(base64.b64decode(conteudo["content"]))
+                  factos["aprovados"] = [x["sha"] for x in doc["approved"]]
+              except Exception as e:
+                  sair(INCONCLUSIVE, ["approved-SHA list malformed (%s)" % type(e).__name__])
+
+              try:
+                  estado, motivos = decidir(claims, factos, time.time())
+              except Exception as e:
+                  sair(INCONCLUSIVE, ["decision raised %s" % type(e).__name__])
+
+              print("FACT=expected_repository %s" % esperado_repo)
+              print("FACT=default_branch %s protected=%s" % (ramo, factos["ramo_protegido"]))
+              print("FACT=job_workflow_sha %s" % str(jws)[:12])
+              print("FACT=approved_count %d" % len(factos["aprovados"]))
+              print("FACT=in_protected_history %s" % factos["na_historia_protegida"])
+              print("FACT=signature %s %s" % (factos["assinatura"], factos["assinatura_detalhe"]))
+              print("FACT=audience_matches %s" % (claims.get("aud") == AUDIENCIA_NORMATIVA))
+              print("FACT=algorithm_allowlist %s" % (",".join(ALGORITMOS_PERMITIDOS)))
+              sair(estado, motivos)
+
+
+          if __name__ == "__main__":
+              main()
+          FIM_DO_VERIFICADOR
+          python3 -c "import ast,io; ast.parse(io.open('/tmp/verify.py',encoding='utf-8').read())" \
+            || { echo "RESULT=INCONCLUSIVE"; echo "REASON=embedded verifier does not parse"; exit 1; }
+          echo "  verifier: embedded, $(wc -c < /tmp/verify.py) bytes, sha256 $(sha256sum /tmp/verify.py | cut -c1-12)"
 
       - name: Derive and verify provenance
         id: verificar
@@ -116,7 +457,7 @@ jobs:
             exit 1
           }
 
-          [ -f /tmp/verify.py ] || inconclusivo "the pinned verifier was not made available"
+          [ -s /tmp/verify.py ] || inconclusivo "the embedded verifier was not materialised"
           [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || inconclusivo "no OIDC endpoint in this environment"
 
           tok=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
