@@ -1,11 +1,13 @@
 """Decision logic for the OIDC provenance gate.
 
-Kept in its own file, and not inside the workflow, for one reason: a test that
-rewrites the logic proves the rewrite. Both the workflow and any battery import
-THIS file, so what is exercised is what ships.
+No third-party imports. The signature check is RSASSA-PKCS1-v1_5 with SHA-256,
+written against the standard library, because a provenance root that pins a
+commit and then installs unpinned cryptography at run time has not pinned
+anything: the same approved commit would verify with different code tomorrow.
+Vendoring the forty lines below removes the question instead of answering it.
 
-`decidir` is pure: it takes the claims and the facts already fetched, and
-returns an outcome. All I/O lives in `main`.
+`decidir` is pure: claims and already-fetched facts in, an outcome out. All I/O
+lives in `main`.
 
 Three outcomes, and the distinction is the point:
 
@@ -21,12 +23,22 @@ truth.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+
 # Normative constant, NOT an input. The caller cannot choose the audience it is
 # measured against; if it could, the check would compare a value the caller
 # picked with a value the caller picked, and confirm only its own consistency.
 AUDIENCIA_NORMATIVA = "reusable-oidc-gate/provenance/v1"
 
 EMISSOR_NORMATIVO = "https://token.actions.githubusercontent.com"
+
+# Normative allowlist. The token header does NOT get to nominate the algorithm
+# it will be checked with -- that would be the caller choosing the strength of
+# the check applied to the caller.
+ALGORITMOS_PERMITIDOS = ("RS256",)
 
 VERIFIED = "VERIFIED"
 REJECTED = "REJECTED"
@@ -35,23 +47,102 @@ INCONCLUSIVE = "INCONCLUSIVE"
 CAMINHO_GATE = ".github/workflows/gate.yml"
 FICHEIRO_APROVADOS = "approved-shas.json"
 
+# DER prefix of DigestInfo(SHA-256), RFC 8017 A.2.4.
+_PREFIXO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
 
-def _hex40(v) -> bool:
+
+def b64u(dados):
+    s = dados + "=" * (-len(dados) % 4)
+    return base64.urlsafe_b64decode(s.encode("ascii"))
+
+
+def _hex40(v):
     if not isinstance(v, str) or len(v) != 40:
         return False
     return all(c in "0123456789abcdef" for c in v)
 
 
-def decidir(claims, factos, agora):
-    """Return (outcome, [reasons]).
+# ---------------------------------------------------------- signature, stdlib
 
-    claims  -- the OIDC payload, already signature-verified by the caller of
-               this function; `factos['assinatura']` carries that result.
-    factos  -- what was fetched from outside: signature outcome, the gate
-               repository's default branch, whether it is protected, and the
-               approved-SHA list read from that branch.
-    agora   -- unix seconds, from the system clock.
+def verificar_assinatura(token, jwks):
+    """(estado, detalhe), estado in {ok, mau, inconclusive}.
+
+    `mau` means the proof is known to be bad. `inconclusive` means it could not
+    be judged: no usable key, unreadable structure, unsupported key type.
     """
+    if not isinstance(token, str) or token.count(".") != 2:
+        return "inconclusive", "token is not a three-part JWS"
+    cabeca_b64, carga_b64, assinatura_b64 = token.split(".")
+
+    try:
+        cabeca = json.loads(b64u(cabeca_b64))
+    except Exception as e:
+        return "inconclusive", "unreadable header (%s)" % type(e).__name__
+    if not isinstance(cabeca, dict):
+        return "inconclusive", "header is not an object"
+
+    alg = cabeca.get("alg")
+    if alg not in ALGORITMOS_PERMITIDOS:
+        # Refused as a POLICY failure, not an inability: a token offering
+        # `none`, HS256 or RS512 is not unjudgeable -- it is asking to be
+        # judged differently.
+        return "mau", "algorithm %r is not in the normative allowlist" % (alg,)
+
+    if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+        return "inconclusive", "key set is not a JWKS"
+    chaves = jwks["keys"]
+    if not chaves:
+        return "inconclusive", "key set has no keys"
+
+    kid = cabeca.get("kid")
+    jwk = None
+    for k in chaves:
+        if isinstance(k, dict) and k.get("kid") == kid:
+            jwk = k
+            break
+    if jwk is None:
+        return "mau", "kid not in key set"
+    if jwk.get("kty") != "RSA":
+        return "inconclusive", "key type %r unsupported" % jwk.get("kty")
+    if "alg" in jwk and jwk["alg"] not in ALGORITMOS_PERMITIDOS:
+        return "mau", "key declares algorithm %r" % jwk["alg"]
+
+    try:
+        n = int.from_bytes(b64u(jwk["n"]), "big")
+        e = int.from_bytes(b64u(jwk["e"]), "big")
+        assinatura = b64u(assinatura_b64)
+    except Exception as ex:
+        return "inconclusive", "key or signature unreadable (%s)" % type(ex).__name__
+    if n <= 0 or e <= 0:
+        return "inconclusive", "key parameters out of range"
+
+    k = (n.bit_length() + 7) // 8
+    if len(assinatura) != k:
+        return "mau", "signature length does not match the modulus"
+
+    s = int.from_bytes(assinatura, "big")
+    if s >= n:
+        return "mau", "signature out of range"
+
+    # RSAVP1, then the EMSA-PKCS1-v1_5 comparison, RFC 8017.
+    m = pow(s, e, n)
+    em = m.to_bytes(k, "big")
+
+    assinado = ("%s.%s" % (cabeca_b64, carga_b64)).encode("ascii")
+    t = _PREFIXO_SHA256 + hashlib.sha256(assinado).digest()
+    if k < len(t) + 11:
+        return "inconclusive", "modulus too small for this digest"
+    esperado = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+
+    if not hmac.compare_digest(em, esperado):
+        return "mau", "signature does not verify"
+    return "ok", ""
+
+
+# ------------------------------------------------------------------- decision
+
+def decidir(claims, factos, agora):
+    """Return (outcome, [reasons])."""
     if not isinstance(claims, dict):
         return INCONCLUSIVE, ["claims are not an object"]
     if not isinstance(factos, dict):
@@ -62,7 +153,8 @@ def decidir(claims, factos, agora):
     if assinatura is None:
         return INCONCLUSIVE, ["signature verification did not run"]
     if assinatura == "inconclusive":
-        return INCONCLUSIVE, ["signature could not be verified: %s" % factos.get("assinatura_detalhe", "unknown")]
+        return INCONCLUSIVE, ["signature could not be verified: %s"
+                              % factos.get("assinatura_detalhe", "unknown")]
 
     aprovados = factos.get("aprovados")
     if aprovados is None:
@@ -72,8 +164,14 @@ def decidir(claims, factos, agora):
     if len(aprovados) == 0:
         # An empty set is not permission to pass. It is the absence of an answer.
         return INCONCLUSIVE, ["approved-SHA list is empty"]
-    if not all(_hex40(s) for s in aprovados):
+    if not all(_hex40(x) for x in aprovados):
         return INCONCLUSIVE, ["approved-SHA list contains an entry that is not a commit id"]
+
+    # Without this the repository check below would simply not happen, and a
+    # workflow that forgot to fix it would verify tokens naming any repository.
+    # An absent root is not a permissive root: it is the absence of one.
+    if not factos.get("repositorio_esperado"):
+        return INCONCLUSIVE, ["the workflow did not fix an expected repository"]
 
     ramo = factos.get("ramo_por_omissao")
     if not ramo:
@@ -84,7 +182,7 @@ def decidir(claims, factos, agora):
 
     for campo in ("iss", "aud", "exp", "iat", "job_workflow_ref", "job_workflow_sha"):
         if campo not in claims:
-            return INCONCLUSIVE, ["token has no '%s' claim" % campo]
+            return INCONCLUSIVE, ["token has no %r claim" % campo]
 
     try:
         exp = int(claims["exp"])
@@ -121,9 +219,16 @@ def decidir(claims, factos, agora):
 
     ref = jwr.rsplit("@", 1)[-1] if isinstance(jwr, str) and "@" in jwr else ""
     if not _hex40(ref):
-        v.append("called through a moving reference ('%s'), not an immutable commit" % ref)
+        v.append("called through a moving reference (%r), not an immutable commit" % ref)
     elif ref != jws:
         v.append("the pinned ref and job_workflow_sha disagree")
+
+    # The repository must be the one this gate lives in. Supplied by the caller
+    # of `decidir` from a constant fixed in the approved workflow, never read
+    # from the token.
+    prefixo = "%s/%s@" % (factos["repositorio_esperado"], CAMINHO_GATE)
+    if not isinstance(jwr, str) or not jwr.startswith(prefixo):
+        v.append("job_workflow_ref does not name the expected repository")
 
     # EXACT PINNING. Belonging to the protected history is necessary and NOT
     # sufficient: an older commit is in that history too, and an older commit
@@ -150,11 +255,10 @@ def decidir(claims, factos, agora):
     return VERIFIED, []
 
 
-# ---------------------------------------------------------------- I/O wrapper
+# ----------------------------------------------------------------- I/O wrapper
 
 def _http_json(url):
     """Fetch JSON with no credential. Returns (dados, erro)."""
-    import json
     import urllib.error
     import urllib.request
     pedido = urllib.request.Request(url, headers={
@@ -166,7 +270,7 @@ def _http_json(url):
             corpo = r.read()
     except urllib.error.HTTPError as e:
         return None, "HTTP %s" % e.code
-    except Exception as e:  # rede, DNS, TLS, timeout
+    except Exception as e:
         return None, type(e).__name__
     try:
         return json.loads(corpo), None
@@ -174,44 +278,7 @@ def _http_json(url):
         return None, "malformed JSON"
 
 
-def _verificar_assinatura(token, jwks):
-    """(estado, detalhe). estado in {ok, mau, inconclusive}."""
-    try:
-        import jwt
-        from jwt import PyJWKSet
-    except Exception:
-        return "inconclusive", "pyjwt unavailable"
-    try:
-        conjunto = PyJWKSet.from_dict(jwks)
-    except Exception as e:
-        # An empty or unusable key set is not a bad signature: it is the
-        # inability to judge one. This is the crash that used to be laundered
-        # into a rejection.
-        return "inconclusive", "key set unusable (%s)" % type(e).__name__
-    if not conjunto.keys:
-        return "inconclusive", "key set has no keys"
-    try:
-        cabeca = jwt.get_unverified_header(token)
-    except Exception as e:
-        return "mau", "unreadable header (%s)" % type(e).__name__
-    chave = None
-    for k in conjunto.keys:
-        if k.key_id == cabeca.get("kid"):
-            chave = k.key
-            break
-    if chave is None:
-        return "mau", "kid not in key set"
-    try:
-        jwt.decode(token, key=chave, algorithms=[cabeca["alg"]],
-                   audience=AUDIENCIA_NORMATIVA, issuer=EMISSOR_NORMATIVO)
-        return "ok", ""
-    except Exception as e:
-        return "mau", type(e).__name__
-
-
 def main():
-    import base64
-    import json
     import os
     import sys
     import time
@@ -226,19 +293,21 @@ def main():
     if not token or token.count(".") != 2:
         sair(INCONCLUSIVE, ["no usable token in this environment"])
 
+    # The expected repository is fixed by the approved workflow, which is
+    # immutable at the approved commit. It is NOT read from the token: the
+    # token is what is being judged.
+    esperado_repo = os.environ.get("GATE_EXPECTED_REPO", "")
+    if not esperado_repo:
+        sair(INCONCLUSIVE, ["the workflow did not fix an expected repository"])
+
     try:
-        carga = token.split(".")[1]
-        carga += "=" * (-len(carga) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(carga))
+        claims = json.loads(b64u(token.split(".")[1]))
     except Exception as e:
         sair(INCONCLUSIVE, ["token payload unreadable (%s)" % type(e).__name__])
+    if not isinstance(claims, dict):
+        sair(INCONCLUSIVE, ["token payload is not an object"])
 
-    jwr = claims.get("job_workflow_ref", "")
-    repo = jwr.split("/.github/", 1)[0] if "/.github/" in jwr else ""
-    if not repo:
-        sair(INCONCLUSIVE, ["cannot derive the gate repository from job_workflow_ref"])
-
-    factos = {}
+    factos = {"repositorio_esperado": esperado_repo}
 
     cfg, erro = _http_json("%s/.well-known/openid-configuration" % EMISSOR_NORMATIVO)
     if erro or not isinstance(cfg, dict) or not cfg.get("jwks_uri"):
@@ -247,11 +316,13 @@ def main():
     if erro or not isinstance(jwks, dict):
         sair(INCONCLUSIVE, ["key set unavailable (%s)" % (erro or "malformed")])
 
-    estado, detalhe = _verificar_assinatura(token, jwks)
-    factos["assinatura"] = "ok" if estado == "ok" else ("inconclusive" if estado == "inconclusive" else "mau")
+    estado, detalhe = verificar_assinatura(token, jwks)
+    factos["assinatura"] = estado
     factos["assinatura_detalhe"] = detalhe
 
-    api = "https://api.github.com/repos/%s" % repo
+    # Every network read below is about the EXPECTED repository, fixed by the
+    # workflow. Nothing here is addressed by the token.
+    api = "https://api.github.com/repos/%s" % esperado_repo
     info, erro = _http_json(api)
     if erro or not isinstance(info, dict) or not info.get("default_branch"):
         sair(INCONCLUSIVE, ["gate repository metadata unavailable (%s)" % (erro or "no default_branch")])
@@ -269,37 +340,35 @@ def main():
         if erro or not isinstance(cmp_, dict) or not cmp_.get("status"):
             sair(INCONCLUSIVE, ["ancestry comparison unavailable (%s)" % (erro or "no status")])
         # `ahead` = the branch moved on from this commit; `identical` = it is the
-        # tip. Both place the commit inside that history. `behind`/`diverged` do not.
+        # tip. Both place it inside that history. `behind`/`diverged` do not.
         factos["na_historia_protegida"] = cmp_["status"] in ("identical", "ahead")
     else:
         factos["na_historia_protegida"] = False
 
-    # The approved list is read from the PROTECTED branch, so changing it needs
-    # the same review that protects the gate itself.
+    # Read from the PROTECTED branch, so changing it needs the same review that
+    # protects the gate itself.
     conteudo, erro = _http_json("%s/contents/%s?ref=%s" % (api, FICHEIRO_APROVADOS, ramo))
     if erro or not isinstance(conteudo, dict) or not conteudo.get("content"):
         sair(INCONCLUSIVE, ["approved-SHA list unavailable (%s)" % (erro or "no content")])
     try:
-        bruto = base64.b64decode(conteudo["content"])
-        doc = json.loads(bruto)
-        factos["aprovados"] = [e["sha"] for e in doc["approved"]]
+        doc = json.loads(base64.b64decode(conteudo["content"]))
+        factos["aprovados"] = [x["sha"] for x in doc["approved"]]
     except Exception as e:
         sair(INCONCLUSIVE, ["approved-SHA list malformed (%s)" % type(e).__name__])
 
     try:
         estado, motivos = decidir(claims, factos, time.time())
     except Exception as e:
-        # Any unexpected failure of the decision itself is inconclusive.
         sair(INCONCLUSIVE, ["decision raised %s" % type(e).__name__])
 
-    print("FACT=gate_repository %s" % repo)
+    print("FACT=expected_repository %s" % esperado_repo)
     print("FACT=default_branch %s protected=%s" % (ramo, factos["ramo_protegido"]))
-    print("FACT=job_workflow_sha %s" % jws[:12])
+    print("FACT=job_workflow_sha %s" % str(jws)[:12])
     print("FACT=approved_count %d" % len(factos["aprovados"]))
     print("FACT=in_protected_history %s" % factos["na_historia_protegida"])
     print("FACT=signature %s %s" % (factos["assinatura"], factos["assinatura_detalhe"]))
     print("FACT=audience_matches %s" % (claims.get("aud") == AUDIENCIA_NORMATIVA))
-    print("FACT=window_s %d" % (int(claims.get("exp", 0)) - int(claims.get("iat", 0))))
+    print("FACT=algorithm_allowlist %s" % (",".join(ALGORITMOS_PERMITIDOS)))
     sair(estado, motivos)
 
 

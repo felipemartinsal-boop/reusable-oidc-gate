@@ -86,6 +86,49 @@ anything about the caller's repository. It is a sanity check on the token's
 intended use — not an authorisation, not an identity, and not evidence about the
 caller. Reading it as any of those would be reading a label as a credential.
 
+## Root of trust — where it is, and why not in the token
+
+An earlier version read the repository and commit out of the JWT payload
+**before** verifying its signature, fetched a verifier from that location, and
+ran it. Unauthenticated data chose the code that would do the authentication.
+Even where the happy path holds, the property claimed is that the signature is
+the root — so nothing may depend on it before it is proven.
+
+Two constants are now fixed in [`gate.yml`](.github/workflows/gate.yml), which
+is immutable at the approved commit:
+
+| constant | what it forbids |
+|---|---|
+| `GATE_EXPECTED_REPO` | fetching the verifier from anywhere else |
+| `VERIFY_SHA256` | executing any bytes other than the approved `verify.py` |
+
+Both are checked before Python runs. The commit comes from
+`GITHUB_WORKFLOW_SHA`, set by the platform for the workflow file that provided
+the job — not from the token. A payload naming another repository or another
+commit changes neither constant, so it cannot select code; the decision then
+refuses it as a policy failure.
+
+## No run-time dependencies
+
+`verify.py` implements RS256 — RSASSA-PKCS1-v1_5 with SHA-256 — against the
+standard library. Pinning a commit and then installing unpinned cryptography
+would leave the approved commit verifying with different code tomorrow, which is
+not pinning. The algorithm allowlist is a constant: the token's own header does
+not get to nominate how it will be checked, and `none`, `HS256` and `RS512` are
+refused explicitly.
+
+## Proof
+
+[`tests/bateria.py`](tests/bateria.py) imports the shipped `verify.py` and
+covers the signature, the decision, the bootstrap and the pinned digest — 43
+cases, run in CI on three Python versions. It is entirely synthetic: a
+throwaway RSA key built in-process, no network, and **no data from any caller**.
+
+A battery that restated the logic would prove the restatement, so there is no
+second copy of a rule in it. One of its checks compares `VERIFY_SHA256` against
+the actual file, so a change to the verifier that forgets to re-pin the digest
+cannot reach the protected branch.
+
 ## Trust boundary
 
 This workflow gives a caller evidence that **it cannot forge**: the OIDC

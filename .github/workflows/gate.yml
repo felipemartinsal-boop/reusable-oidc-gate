@@ -3,19 +3,31 @@ name: OIDC provenance gate
 # Reusable gate. Derives the provenance of the job that called it and verifies
 # it against sources outside the calling repository.
 #
-# The decision lives in verify.py, not here. A battery that rewrote the logic
-# would prove the rewrite; keeping it in a shipped file means what is tested is
-# what runs.
+# ROOT OF TRUST, AND WHY IT IS HERE AND NOT IN THE TOKEN
 #
-# NO INPUTS. An earlier version took the audience as an input, which made the
-# check circular: the caller chose both the value requested and the value
-# compared. The audience is a constant, and verify.py re-checks it against its
-# own constant -- if the two ever drift apart the token simply fails to verify,
-# so the duplication can cause a rejection but never a false pass.
+# An earlier version read the repository and commit out of the JWT payload
+# BEFORE verifying its signature, then downloaded a verifier from that location
+# and ran it. Unauthenticated data chose the code that would do the
+# authentication. Even where the happy path holds, the property claimed is that
+# the signature is the root -- so nothing may depend on it before it is proven.
 #
-# Nothing is read from the caller's checkout and no input is accepted. The
-# repository and commit of this workflow are taken from the OIDC payload, whose
-# signature is verified before any of it is trusted.
+# Fixed here instead, in the file that is immutable at the approved commit:
+#
+#   GATE_EXPECTED_REPO   the only repository the verifier may be fetched from
+#   VERIFY_SHA256        the exact bytes of verify.py that may be executed
+#
+# Both are checked before python runs anything. A payload naming another
+# repository or another commit changes neither, so it cannot select code.
+#
+# NO INPUTS. An earlier version took the audience as one, which made the check
+# circular: the caller chose both the value requested and the value compared.
+# The audience is a constant of verify.py; it is duplicated below only to
+# request the token, and verify.py re-checks it against its own constant, so
+# drift can cause a rejection and never a false pass.
+#
+# NO RUN-TIME DEPENDENCY INSTALL. verify.py implements RS256 against the
+# standard library. Pinning a commit and then installing unpinned cryptography
+# would leave the approved commit verifying with different code tomorrow.
 #
 # Three outcomes: VERIFIED, REJECTED (a rule was broken), INCONCLUSIVE (the
 # verification could not be carried out). An unexpected failure is never a
@@ -37,14 +49,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       result: ${{ steps.verificar.outputs.result }}
+    env:
+      # --- root of trust, fixed in this file ------------------------------
+      GATE_EXPECTED_REPO: felipemartinsal-boop/reusable-oidc-gate
+      # sha256 of verify.py at this commit. tests/bateria.py fails if the two
+      # ever drift, so a change to the verifier that forgets this line does not
+      # reach the protected branch.
+      VERIFY_SHA256: c94bfda909b68307efeb0bf59044f834e756bcd1853593e2ad04c7972d478823
+      # Same constant as verify.py:AUDIENCIA_NORMATIVA.
+      AUDIENCIA: reusable-oidc-gate/provenance/v1
     steps:
-      - name: Derive and verify provenance
-        id: verificar
+      - name: Fetch the pinned verifier and check its digest
+        id: fonte
         shell: bash
-        env:
-          # Same constant as verify.py:AUDIENCIA_NORMATIVA. Duplicated on
-          # purpose and checked there: drift causes a rejection, not a pass.
-          AUDIENCIA: reusable-oidc-gate/provenance/v1
         run: |
           set -uo pipefail
 
@@ -55,41 +72,52 @@ jobs:
             exit 1
           }
 
+          # The commit is this workflow's own, reported by the platform for the
+          # workflow file that provided this job. It is NOT taken from the token.
+          sha="${GITHUB_WORKFLOW_SHA:-}"
+          if [ -z "$sha" ]; then
+            inconclusivo "the platform did not expose this workflow's commit"
+          fi
+          echo "  expected repository : ${GATE_EXPECTED_REPO}"
+          echo "  workflow commit     : ${sha:0:12}"
+
+          # Both halves of this URL are constants of this file. Nothing the
+          # caller or the token says can move it.
+          curl -sS --fail-with-body -o /tmp/verify.py \
+            "https://raw.githubusercontent.com/${GATE_EXPECTED_REPO}/${sha}/verify.py" \
+            || inconclusivo "verifier source unreachable at the pinned commit"
+          [ -s /tmp/verify.py ] || inconclusivo "verifier source empty"
+
+          obtido=$(sha256sum /tmp/verify.py | cut -d' ' -f1)
+          echo "  verifier digest     : ${obtido:0:12}"
+          if [ "$obtido" != "$VERIFY_SHA256" ]; then
+            inconclusivo "verifier digest does not match the one pinned in this workflow"
+          fi
+
+      - name: Derive and verify provenance
+        id: verificar
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          inconclusivo() {
+            echo "RESULT=INCONCLUSIVE"
+            echo "REASON=$1"
+            echo "result=INCONCLUSIVE" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+          [ -f /tmp/verify.py ] || inconclusivo "the pinned verifier was not made available"
           [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || inconclusivo "no OIDC endpoint in this environment"
 
           tok=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
                 "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCIA}" | jq -r '.value // empty') || true
           [ -n "$tok" ] || inconclusivo "token request failed"
 
-          # Where this workflow lives comes from the token, not from an
-          # environment variable and not from the caller. It is untrusted at
-          # this instant -- a lie here makes the signature check fail inside
-          # verify.py, which is where trust is established.
-          # -r matters: without it jq emits a JSON-quoted string and the quotes
-          # end up inside the repository name and the commit id. Measured: the
-          # fetch then 404s and the gate reports INCONCLUSIVE forever.
-          jwr=$(printf '%s' "$tok" | jq -Rr 'split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson | .job_workflow_ref // empty') || true
-          [ -n "$jwr" ] || inconclusivo "token has no job_workflow_ref"
-          repo="${jwr%%/.github/*}"
-          sha="${jwr##*@}"
-          [ -n "$repo" ] || inconclusivo "cannot derive the gate repository from job_workflow_ref"
-          printf '%s' "$repo" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'             || inconclusivo "the repository derived from job_workflow_ref is not a plain owner/name"
-
-          echo "  gate repository : ${repo}"
-          echo "  gate ref        : ${sha:0:12}"
-
-          curl -sS --fail-with-body -o /tmp/verify.py \
-            "https://raw.githubusercontent.com/${repo}/${sha}/verify.py" \
-            || inconclusivo "verifier source unreachable at the declared commit"
-          [ -s /tmp/verify.py ] || inconclusivo "verifier source empty"
-
-          python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography \
-            || inconclusivo "verifier dependencies unavailable"
-
           # The token never reaches the log: it goes in the environment, and the
           # verifier prints only derived facts.
           set +e
-          saida=$(GATE_TOKEN="$tok" python3 /tmp/verify.py 2>&1)
+          saida=$(GATE_TOKEN="$tok" GATE_EXPECTED_REPO="$GATE_EXPECTED_REPO" python3 /tmp/verify.py 2>&1)
           codigo=$?
           set -e
           unset tok

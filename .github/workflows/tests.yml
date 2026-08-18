@@ -1,0 +1,39 @@
+name: tests
+
+# CI sintetico da bateria. Corre o ficheiro versionado tests/bateria.py, que
+# importa exactamente o verify.py enviado -- nao uma copia, nao uma reescrita.
+#
+# Nada aqui toca em dados de quem chama o gate: a chave e' gerada no processo, o
+# JWKS e' construido dela, e os claims sao escritos a mao. Nenhum token real,
+# nenhuma rede, nenhum segredo.
+#
+# Sem dependencias: a bateria e o verificador sao stdlib. Se algum dia isto
+# precisar de `pip install`, a razao do desenho caiu.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bateria:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: No third-party import reaches the verifier
+        run: |
+          if grep -nE '^\s*(import|from)\s+(jwt|cryptography|requests|httpx)' verify.py; then
+            echo "FAIL: the verifier imports a third-party module"; exit 1
+          fi
+          echo "ok: verify.py is standard library only"
+      - name: Battery against the shipped verifier
+        run: python tests/bateria.py
