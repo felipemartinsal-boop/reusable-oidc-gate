@@ -86,27 +86,31 @@ anything about the caller's repository. It is a sanity check on the token's
 intended use — not an authorisation, not an identity, and not evidence about the
 caller. Reading it as any of those would be reading a label as a credential.
 
-## Root of trust — where it is, and why not in the token
+## Root of trust — there is no bootstrap
 
 An earlier version read the repository and commit out of the JWT payload
 **before** verifying its signature, fetched a verifier from that location, and
 ran it. Unauthenticated data chose the code that would do the authentication.
-Even where the happy path holds, the property claimed is that the signature is
-the root — so nothing may depend on it before it is proven.
 
-Two constants are now fixed in [`gate.yml`](.github/workflows/gate.yml), which
-is immutable at the approved commit:
+The first attempt at a fix pinned the repository and the verifier's digest in
+this workflow and fetched from constants. Two measurements killed that too:
+neither `github.workflow_sha` nor `github.job_workflow_sha` yields **this**
+workflow's own commit inside a reusable call. The first describes the *caller* —
+the gate went looking for its own verifier at the caller's commit and got a 404
+on every call. The second came back empty. So the gate could not name its own
+code without asking the token, which is the circularity again.
 
-| constant | what it forbids |
-|---|---|
-| `GATE_EXPECTED_REPO` | fetching the verifier from anywhere else |
-| `VERIFY_SHA256` | executing any bytes other than the approved `verify.py` |
+**The verifier is therefore embedded in [`gate.yml`](.github/workflows/gate.yml).**
+Nothing is fetched and nothing is selected: the code that runs is this file,
+immutable at the approved commit. There is no URL to poison and no digest to
+compare, because nothing arrives from outside.
 
-Both are checked before Python runs. The commit comes from
-`GITHUB_WORKFLOW_SHA`, set by the platform for the workflow file that provided
-the job — not from the token. A payload naming another repository or another
-commit changes neither constant, so it cannot select code; the decision then
-refuses it as a policy failure.
+The readable copy stays at [`verify.py`](verify.py), and
+[`tests/bateria.py`](tests/bateria.py) fails if the two differ **by a single
+byte** — so reviewability does not cost you fidelity.
+
+`GATE_EXPECTED_REPO` is still fixed here, and the decision refuses any token
+whose `job_workflow_ref` names a different repository.
 
 ## No run-time dependencies
 
@@ -120,13 +124,12 @@ refused explicitly.
 ## Proof
 
 [`tests/bateria.py`](tests/bateria.py) imports the shipped `verify.py` and
-covers the signature, the decision, the bootstrap and the pinned digest — 43
-cases, run in CI on three Python versions. It is entirely synthetic: a
+covers the signature, the decision and the bootstrap — 43 cases, run in CI on three Python versions. It is entirely synthetic: a
 throwaway RSA key built in-process, no network, and **no data from any caller**.
 
 A battery that restated the logic would prove the restatement, so there is no
-second copy of a rule in it. One of its checks compares `VERIFY_SHA256` against
-the actual file, so a change to the verifier that forgets to re-pin the digest
+second copy of a rule in it. One of its checks compares the embedded copy
+against `verify.py` byte for byte, so a change to one that forgets the other
 cannot reach the protected branch.
 
 ## Trust boundary

@@ -241,60 +241,57 @@ registar("B2", "payload aponta para outro repo E outro SHA",
 registar("B3", "o workflow nao fixou repositorio esperado -> INCONCLUSIVE",
          decidir(claims(), factos(repositorio_esperado=None)), V.INCONCLUSIVE)
 
-# O gate nao pode construir o URL do verificador a partir do token. Isto le o
-# workflow enviado e exige-o, porque nenhum teste da decisao pode provar uma
-# propriedade do bootstrap.
+# Nenhum teste da decisao pode provar uma propriedade do bootstrap, portanto
+# estas asserções leem o workflow enviado.
 gate = open(os.path.join(RAIZ, V.CAMINHO_GATE), encoding="utf-8").read()
 
-# O URL so pode interpolar nomes cuja origem seja constante deste ficheiro ou
-# da plataforma. Qualquer outro nome ali seria uma via para o payload escolher
-# de onde vem o codigo.
-NOMES_PERMITIDOS = {"GATE_EXPECTED_REPO", "sha"}  # `sha` vem de COMMIT_DO_GATE
-urls = re.findall(r"raw\.githubusercontent\.com/[^\"'\s]*", gate)
-nomes = set()
-for u in urls:
-    nomes |= set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", u))
-registar("B4", "URL do verificador so interpola constantes conhecidas",
-         "sim" if urls and nomes and nomes <= NOMES_PERMITIDOS else "nao", "sim",
-         "urls=%s nomes=%s" % (urls, sorted(nomes)))
-
-# E `sha` tem de vir da plataforma, nao do token.
-# O commit tem de vir do contexto que descreve o workflow CHAMADO. Medido: o
-# `github.workflow_sha` descreve o CHAMADOR, e usa-lo fazia o gate buscar o
-# proprio verificador no commit do chamador -- 404 em todas as chamadas.
-registar("B4b", "o commit do gate vem de github.job_workflow_sha",
-         "sim" if re.search(r"COMMIT_DO_GATE:\s*\$\{\{\s*github\.job_workflow_sha\s*\}\}", gate)
-         else "nao", "sim")
-registar("B4d", "o commit do chamador nao e usado para buscar nada",
-         "sim" if "COMMIT_DO_CHAMADOR" in gate
-         and not re.search(r"raw\.githubusercontent\.com/[^\"']*COMMIT_DO_CHAMADOR", gate)
+# O verificador vai EMBUTIDO. Nada e' buscado, logo nao ha origem que o payload
+# possa mover.
+registar("B4", "o gate nao busca codigo de lado nenhum",
+         "sim" if not re.search(r"raw\.githubusercontent|curl[^\n]*\.py|git clone|actions/checkout", gate)
          else "nao", "sim")
 
-# O passo que busca o verificador nao pode tocar no token.
-passo_fonte = gate.split("Fetch the pinned verifier")[1].split("- name:")[0]
-registar("B4c", "o passo da busca nao le o token nem claims",
-         "sim" if not re.search(r"job_workflow_ref|ACTIONS_ID_TOKEN|GATE_TOKEN|jq", passo_fonte) else "nao",
-         "sim")
+m = re.search(r"<<'FIM_DO_VERIFICADOR'\n(.*?)\n\s*FIM_DO_VERIFICADOR\n", gate, re.S)
+registar("B4b", "o workflow embute um verificador", "sim" if m else "nao", "sim")
+if m:
+    # O bloco YAML remove a indentacao comum; reproduz-se aqui a mesma remocao.
+    linhas = m.group(1).split("\n")
+    recuo = min((len(l) - len(l.lstrip()) for l in linhas if l.strip()), default=0)
+    embutido = "\n".join(l[recuo:] if l.strip() else "" for l in linhas) + "\n"
+    original = open(CAMINHO_VERIFY, encoding="utf-8", newline="").read()
+    registar("B4c", "o embutido e byte a byte igual a verify.py",
+             "igual" if embutido == original else "divergente", "igual",
+             "embutido=%d bytes, ficheiro=%d bytes" % (len(embutido), len(original)))
+    try:
+        compile(embutido, "<embutido>", "exec")
+        registar("B4d", "o embutido compila como Python", "sim", "sim")
+    except Exception as e:
+        registar("B4d", "o embutido compila como Python", type(e).__name__, "sim")
+
+passo_embutir = gate.split("Materialise the embedded verifier")[1].split("- name:")[0]
+# Sem o heredoc: o verificador embutido menciona GATE_TOKEN por desenho, e nao e'
+# isso que se quer testar. O que se testa e' se os COMANDOS deste passo tocam no
+# token.
+comandos_embutir = re.sub(r"<<'FIM_DO_VERIFICADOR'.*?FIM_DO_VERIFICADOR", "", passo_embutir, flags=re.S)
+registar("B4e", "os comandos que embutem nao leem o token nem claims",
+         "sim" if not re.search(r"job_workflow_ref|ACTIONS_ID_TOKEN|GATE_TOKEN|jq ", comandos_embutir)
+         else "nao", "sim")
+
 registar("B5", "o workflow fixa o repositorio esperado",
          "sim" if "GATE_EXPECTED_REPO" in gate else "nao", "sim")
-registar("B6", "o workflow verifica o digest do verificador antes de o correr",
-         "sim" if "VERIFY_SHA256" in gate and "sha256sum" in gate else "nao", "sim")
+
+# Só linhas efectivas: o cabecalho do workflow FALA do commit do chamador para
+# explicar por que nao o usa, e um comentario nao e' codigo.
+efectivas = "\n".join(l for l in gate.split("\n") if not l.lstrip().startswith("#"))
+efectivas = re.sub(r"<<'FIM_DO_VERIFICADOR'.*?FIM_DO_VERIFICADOR", "", efectivas, flags=re.S)
+registar("B6", "nenhuma linha efectiva usa o commit do chamador",
+         "sim" if not re.search(r"GITHUB_WORKFLOW_SHA|github\.workflow_sha", efectivas) else "nao",
+         "sim")
 registar("B7", "o workflow nao instala dependencias em tempo de execucao",
          "nao" if "pip install" in gate else "sim", "sim")
 registar("B8", "o verificador nao importa terceiros",
-         "sim" if not re.search(r"^\s*(import|from)\s+(jwt|cryptography|requests)",
+         "sim" if not re.search(r"^\s*(import|from)\s+(jwt|cryptography|requests|httpx)",
                                 open(CAMINHO_VERIFY, encoding="utf-8").read(), re.M) else "nao", "sim")
-
-# =========================================== 4. digest fixado bate com o ficheiro
-print("\n--- integridade: o digest fixado descreve o ficheiro enviado ---")
-
-m = re.search(r"VERIFY_SHA256:\s*([0-9a-f]{64})", gate)
-digest_ficheiro = hashlib.sha256(open(CAMINHO_VERIFY, "rb").read()).hexdigest()
-registar("I1", "VERIFY_SHA256 esta fixado no workflow", "sim" if m else "nao", "sim")
-if m:
-    registar("I2", "o digest fixado bate com verify.py",
-             "bate" if m.group(1) == digest_ficheiro else "divergente", "bate",
-             "fixado=%s ficheiro=%s" % (m.group(1)[:12], digest_ficheiro[:12]))
 
 # ===================================================================== resumo
 print("\n%d casos" % casos)
