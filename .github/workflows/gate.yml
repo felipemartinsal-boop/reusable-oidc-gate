@@ -65,11 +65,15 @@ jobs:
           # environment variable and not from the caller. It is untrusted at
           # this instant -- a lie here makes the signature check fail inside
           # verify.py, which is where trust is established.
-          jwr=$(printf '%s' "$tok" | jq -R 'split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson | .job_workflow_ref // empty') || true
+          # -r matters: without it jq emits a JSON-quoted string and the quotes
+          # end up inside the repository name and the commit id. Measured: the
+          # fetch then 404s and the gate reports INCONCLUSIVE forever.
+          jwr=$(printf '%s' "$tok" | jq -Rr 'split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson | .job_workflow_ref // empty') || true
           [ -n "$jwr" ] || inconclusivo "token has no job_workflow_ref"
           repo="${jwr%%/.github/*}"
           sha="${jwr##*@}"
           [ -n "$repo" ] || inconclusivo "cannot derive the gate repository from job_workflow_ref"
+          printf '%s' "$repo" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'             || inconclusivo "the repository derived from job_workflow_ref is not a plain owner/name"
 
           echo "  gate repository : ${repo}"
           echo "  gate ref        : ${sha:0:12}"
