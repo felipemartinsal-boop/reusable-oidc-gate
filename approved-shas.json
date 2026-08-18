@@ -1,0 +1,5 @@
+{
+  "schema": "reusable-oidc-gate/approved@1",
+  "note": "Commits of this repository that the gate accepts as its own. Belonging to the protected history is necessary and NOT sufficient: an older commit is in that history too, and an older commit may carry a weaker gate. Adding an entry here requires a reviewed pull request against the protected branch.",
+  "approved": []
+}

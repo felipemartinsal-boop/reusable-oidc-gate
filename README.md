@@ -36,22 +36,68 @@ Any failure fails the job. An empty result, an unreachable API or a missing clai
 ```yaml
 jobs:
   verify:
-    # Pin an immutable commit. A branch or tag here is rejected by design.
-    uses: felipemartinsal-boop/reusable-oidc-gate/.github/workflows/gate.yml@<commit-sha>
+    # Pin an immutable commit, and one that appears in approved-shas.json on the
+    # protected branch. A branch, a tag, or any other commit is rejected.
+    uses: felipemartinsal-boop/reusable-oidc-gate/.github/workflows/gate.yml@<approved-commit-sha>
     permissions:
       id-token: write
-    with:
-      audience: your-audience
 ```
 
-The job runs inside the **caller's** workflow run, so the caller's logs stay in the caller's
-repository. Nothing executes here.
+There are **no inputs**. An earlier version took the audience as one, which made
+that check circular: the caller chose both the value requested and the value it
+was compared against, so the test confirmed only the caller's consistency with
+itself.
+
+The job runs inside the **caller's** workflow run, so the caller's logs stay in
+the caller's repository. Nothing executes here.
+
+## Outcomes
+
+| outcome | meaning |
+|---|---|
+| `VERIFIED` | every rule held |
+| `REJECTED` | a rule was broken — a policy failure, or a proof known to be bad |
+| `INCONCLUSIVE` | the verification could not be carried out: a crash, an empty key set, a network error, a malformed response |
+
+`INCONCLUSIVE` is not a softer `REJECTED`. Collapsing the two lets a crash read
+as "we checked and it was bad", which is a lie shaped exactly like the truth.
+No catch-all turns an unexpected failure into a rejection.
+
+## Exact pinning
+
+Belonging to the protected branch's history is **necessary and not sufficient**.
+An older commit is in that history too, and an older commit may carry a weaker
+gate — so ancestry alone permits a silent downgrade. The commit must also appear
+in [`approved-shas.json`](approved-shas.json) as read from the protected branch,
+which means adding one takes a reviewed pull request.
+
+Both conditions are checked independently.
+
+## What the audience binds, and what it does not
+
+The audience is a constant of the verifier, not a parameter.
+
+**It binds:** the token to this gate's purpose. A token minted for some other
+audience will not verify here, so one obtained elsewhere cannot be replayed
+into this check.
+
+**It does not bind:** who called, whether that caller was authorised, or
+anything about the caller's repository. It is a sanity check on the token's
+intended use — not an authorisation, not an identity, and not evidence about the
+caller. Reading it as any of those would be reading a label as a credential.
 
 ## Trust boundary
 
-This workflow gives a caller evidence that **it cannot forge**: the OIDC signature is made by the
-issuer, and `job_workflow_ref`/`job_workflow_sha` are set by the platform, not by the caller.
+This workflow gives a caller evidence that **it cannot forge**: the OIDC
+signature is made by the issuer, and `job_workflow_ref`/`job_workflow_sha` are
+set by the platform, not by the caller.
 
-It does **not** protect against someone who administers the repositories involved. Anyone able to
-change this repository's protected branch, or to change how the caller consumes the result, is
-outside the guarantee. That is a governance problem, not something a workflow can solve.
+It does **not** protect against someone who administers the repositories
+involved. Anyone able to change this repository's protected branch, or to change
+how the caller consumes the result, is outside the guarantee.
+
+**It also does not cover the consumer.** This gate produces evidence; it cannot
+make anyone act on it. A caller that ignores the outcome, or that rewrites its
+own verification, is unaffected by anything here. Externalising the producer of
+a proof is not the same as externalising the decision, and only the first is on
+offer.
