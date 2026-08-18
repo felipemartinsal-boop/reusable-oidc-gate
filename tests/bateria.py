@@ -249,7 +249,7 @@ gate = open(os.path.join(RAIZ, V.CAMINHO_GATE), encoding="utf-8").read()
 # O URL so pode interpolar nomes cuja origem seja constante deste ficheiro ou
 # da plataforma. Qualquer outro nome ali seria uma via para o payload escolher
 # de onde vem o codigo.
-NOMES_PERMITIDOS = {"GATE_EXPECTED_REPO", "sha"}
+NOMES_PERMITIDOS = {"GATE_EXPECTED_REPO", "sha"}  # `sha` vem de COMMIT_DO_GATE
 urls = re.findall(r"raw\.githubusercontent\.com/[^\"'\s]*", gate)
 nomes = set()
 for u in urls:
@@ -259,8 +259,16 @@ registar("B4", "URL do verificador so interpola constantes conhecidas",
          "urls=%s nomes=%s" % (urls, sorted(nomes)))
 
 # E `sha` tem de vir da plataforma, nao do token.
-registar("B4b", "o commit vem de GITHUB_WORKFLOW_SHA e nao do token",
-         "sim" if re.search(r'sha="\$\{GITHUB_WORKFLOW_SHA:-\}"', gate) else "nao", "sim")
+# O commit tem de vir do contexto que descreve o workflow CHAMADO. Medido: o
+# `github.workflow_sha` descreve o CHAMADOR, e usa-lo fazia o gate buscar o
+# proprio verificador no commit do chamador -- 404 em todas as chamadas.
+registar("B4b", "o commit do gate vem de github.job_workflow_sha",
+         "sim" if re.search(r"COMMIT_DO_GATE:\s*\$\{\{\s*github\.job_workflow_sha\s*\}\}", gate)
+         else "nao", "sim")
+registar("B4d", "o commit do chamador nao e usado para buscar nada",
+         "sim" if "COMMIT_DO_CHAMADOR" in gate
+         and not re.search(r"raw\.githubusercontent\.com/[^\"']*COMMIT_DO_CHAMADOR", gate)
+         else "nao", "sim")
 
 # O passo que busca o verificador nao pode tocar no token.
 passo_fonte = gate.split("Fetch the pinned verifier")[1].split("- name:")[0]
