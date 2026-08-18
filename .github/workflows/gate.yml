@@ -58,6 +58,13 @@ jobs:
       VERIFY_SHA256: c94bfda909b68307efeb0bf59044f834e756bcd1853593e2ad04c7972d478823
       # Same constant as verify.py:AUDIENCIA_NORMATIVA.
       AUDIENCIA: reusable-oidc-gate/provenance/v1
+      # The commit of THIS workflow file, set by the platform for the called
+      # workflow. Measured, not assumed: GITHUB_WORKFLOW_SHA describes the
+      # CALLER -- using it made the gate fetch its own verifier at the caller's
+      # commit, which 404s. `github.job_workflow_sha` is the one that describes
+      # the workflow that provided the job. Neither comes from the token.
+      COMMIT_DO_GATE: ${{ github.job_workflow_sha }}
+      COMMIT_DO_CHAMADOR: ${{ github.workflow_sha }}
     steps:
       - name: Fetch the pinned verifier and check its digest
         id: fonte
@@ -74,12 +81,14 @@ jobs:
 
           # The commit is this workflow's own, reported by the platform for the
           # workflow file that provided this job. It is NOT taken from the token.
-          sha="${GITHUB_WORKFLOW_SHA:-}"
-          if [ -z "$sha" ]; then
-            inconclusivo "the platform did not expose this workflow's commit"
-          fi
+          sha="${COMMIT_DO_GATE:-}"
+          case "$sha" in
+            ????????????????????????????????????????) ;;
+            *) inconclusivo "the platform did not expose this workflow's own commit" ;;
+          esac
           echo "  expected repository : ${GATE_EXPECTED_REPO}"
-          echo "  workflow commit     : ${sha:0:12}"
+          echo "  gate commit         : ${sha:0:12}"
+          echo "  caller commit       : ${COMMIT_DO_CHAMADOR:0:12}  (not used to fetch anything)"
 
           # Both halves of this URL are constants of this file. Nothing the
           # caller or the token says can move it.
