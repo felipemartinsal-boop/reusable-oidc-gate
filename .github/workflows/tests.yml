@@ -35,5 +35,14 @@ jobs:
             echo "FAIL: the verifier imports a third-party module"; exit 1
           fi
           echo "ok: verify.py is standard library only"
+      - name: The embedded copy is regenerated, not hand-edited
+        run: |
+          python tests/embutir.py
+          if ! git diff --quiet; then
+            echo "FAIL: gate.yml does not match what tests/embutir.py produces from verify.py"
+            git --no-pager diff --stat
+            exit 1
+          fi
+          echo "ok: the embedded verifier is exactly what the generator produces"
       - name: Battery against the shipped verifier
         run: python tests/bateria.py

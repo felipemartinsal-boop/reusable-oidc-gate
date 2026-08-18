@@ -40,6 +40,15 @@ EMISSOR_NORMATIVO = "https://token.actions.githubusercontent.com"
 # the check applied to the caller.
 ALGORITMOS_PERMITIDOS = ("RS256",)
 
+# Politica fechada dos parametros RSA. RFC 8725 pede que a aplicacao decida o
+# que aceita; um modulo curto ou um expoente degenerado sao violacoes CONHECIDAS
+# de politica, nao incapacidade de julgar, e por isso reprovam em vez de ficarem
+# inconclusivos. 2048 e' o tamanho das chaves do emissor e o minimo que a NIST
+# ainda considera utilizavel.
+MODULO_MINIMO_BITS = 2048
+EXPOENTE_MINIMO = 3
+USOS_ACEITOS = (None, "sig")
+
 VERIFIED = "VERIFIED"
 REJECTED = "REJECTED"
 INCONCLUSIVE = "INCONCLUSIVE"
@@ -52,8 +61,16 @@ _PREFIXO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
 def b64u(dados):
+    """base64url ESTRITO.
+
+    `urlsafe_b64decode` ignora em silencio caracteres fora do alfabeto, e isso
+    ja custou um resultado errado: um modulo com lixo era decodificado para um
+    inteiro pequeno e reprovava como "modulo curto" -- uma violacao de politica
+    inventada a partir de infraestrutura ilegivel. Com validacao estrita, lixo
+    levanta excepcao e a classificacao volta a ser INCONCLUSIVE.
+    """
     s = dados + "=" * (-len(dados) % 4)
-    return base64.urlsafe_b64decode(s.encode("ascii"))
+    return base64.b64decode(s.encode("ascii"), altchars=b"-_", validate=True)
 
 
 def _hex40(v):
@@ -115,6 +132,15 @@ def verificar_assinatura(token, jwks):
         return "inconclusive", "key or signature unreadable (%s)" % type(ex).__name__
     if n <= 0 or e <= 0:
         return "inconclusive", "key parameters out of range"
+
+    # --- politica fechada dos parametros (RFC 8725 3.1-3.4) ---------------
+    if n.bit_length() < MODULO_MINIMO_BITS:
+        return "mau", "modulus is %d bits, below the normative minimum of %d" % (
+            n.bit_length(), MODULO_MINIMO_BITS)
+    if e < EXPOENTE_MINIMO or e % 2 == 0:
+        return "mau", "public exponent %d is not a valid RSA exponent" % e
+    if jwk.get("use") not in USOS_ACEITOS:
+        return "mau", "key declares use %r, which is not signing" % jwk.get("use")
 
     k = (n.bit_length() + 7) // 8
     if len(assinatura) != k:

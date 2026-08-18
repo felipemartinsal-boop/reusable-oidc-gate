@@ -123,14 +123,45 @@ refused explicitly.
 
 ## Proof
 
-[`tests/bateria.py`](tests/bateria.py) imports the shipped `verify.py` and
-covers the signature, the decision and the bootstrap — 43 cases, run in CI on three Python versions. It is entirely synthetic: a
-throwaway RSA key built in-process, no network, and **no data from any caller**.
+[`tests/bateria.py`](tests/bateria.py) exercises the shipped `verify.py` **and**
+the copy extracted from the workflow's heredoc, run as a module — so what is
+proved is what executes. **63 cases**, in CI on three Python versions, entirely
+synthetic: throwaway RSA keys built in-process, no network, and **no data from
+any caller**.
 
-A battery that restated the logic would prove the restatement, so there is no
-second copy of a rule in it. One of its checks compares the embedded copy
-against `verify.py` byte for byte, so a change to one that forgets the other
-cannot reach the protected branch.
+### Why an external vector, and not just a synthetic one
+
+A synthetic positive control signs with the verifier's *own* DigestInfo
+constant. If that constant were wrong, the synthetic issuer would repeat the
+same mistake and the test would stay green over an implementation no real issuer
+would accept. The battery **demonstrates** this before relying on anything: it
+loads a copy of the verifier with a corrupted DigestInfo, shows the synthetic
+control still passes, and shows the same corrupted copy **fails** the vector
+from [RFC 7515, Appendix A.2](https://www.rfc-editor.org/rfc/rfc7515.html#appendix-A.2).
+
+That vector is versioned at
+[`tests/vetor-rfc7515-a2.json`](tests/vetor-rfc7515-a2.json) — fixed signing
+input, `n`, `e` and signature published by the IETF. It uses no helper and no
+constant of this implementation. Tampering with the signature, the payload or
+the key all fail it, and mutating either the DigestInfo or the padding brings it
+down.
+
+### RSA parameters are policy, not description
+
+Modulus below the normative minimum, an even or degenerate exponent, or a key
+declaring `use` other than signing are **rejections** — known policy violations.
+An unreadable parameter is **inconclusive**. That distinction cost a real defect:
+`urlsafe_b64decode` silently ignores characters outside the alphabet, so a
+garbage modulus decoded to a small integer and was reported as "modulus too
+short" — a policy violation invented out of unreadable input. Decoding is now
+strict.
+
+### The embedded copy is generated
+
+[`tests/embutir.py`](tests/embutir.py) writes the block inside `gate.yml` from
+`verify.py`. CI re-runs it and fails if the result differs, and the battery
+compares the two byte for byte — so the readable file and the executed copy
+cannot drift apart.
 
 ## Trust boundary
 
