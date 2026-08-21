@@ -54,6 +54,21 @@ def carregar(nome, fonte, ficheiro):
     return mod
 
 
+def so_lf(texto):
+    """CRLF e CR isolado passam a LF; a newline final deixa de contar.
+
+    So' fins de linha. Um caractere trocado, uma linha reordenada ou um espaco
+    a mais continuam a ser diferencas, e tem de continuar a reprovar -- senao
+    esta normalizacao deixava de proteger o que existe para proteger.
+
+    Existe porque a comparacao lia os dois lados de maneira diferente: verify.py
+    com newline="" (preserva CRLF) e gate.yml em modo texto (converte para LF).
+    Num checkout Windows isso punha CRLF contra LF e acusava 402 bytes de
+    diferenca -- um por linha -- num conteudo identico.
+    """
+    return texto.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+
 FONTE_VERIFY = io.open(CAMINHO_VERIFY, encoding="utf-8", newline="").read()
 V = carregar("verify", FONTE_VERIFY, CAMINHO_VERIFY)
 
@@ -371,9 +386,47 @@ registar("B4", "o gate nao busca codigo de lado nenhum",
          "sim" if not re.search(r"raw\.githubusercontent|curl[^\n]*\.py|git clone|actions/checkout",
                                 GATE) else "nao", "sim")
 registar("B5", "o workflow embute um verificador", "sim" if EMBUTIDO else "nao", "sim")
-registar("B6", "o embutido e byte a byte igual a verify.py",
-         "igual" if _m and FONTE_EMBUTIDA == FONTE_VERIFY else "divergente", "igual",
+registar("B6", "o embutido e igual a verify.py (fins de linha normalizados)",
+         "igual" if _m and so_lf(FONTE_EMBUTIDA) == so_lf(FONTE_VERIFY) else "divergente", "igual",
          "embutido=%d bytes, ficheiro=%d bytes" % (len(FONTE_EMBUTIDA), len(FONTE_VERIFY)))
+
+# --- portabilidade dos fins de linha: casos crafted, sem tocar no disco ------
+# O B6 acima compara ficheiros reais. Estes provam que a normalizacao aceita as
+# quatro formas de fim de linha E continua a recusar diferencas de conteudo.
+_BASE = "linha um\nlinha dois\nlinha tres\n"
+registar("B6a", "LF contra LF", "igual" if so_lf(_BASE) == so_lf(_BASE) else "divergente", "igual")
+registar("B6b", "CRLF contra LF",
+         "igual" if so_lf(_BASE.replace("\n", "\r\n")) == so_lf(_BASE) else "divergente", "igual")
+registar("B6c", "CR isolado contra LF",
+         "igual" if so_lf(_BASE.replace("\n", "\r")) == so_lf(_BASE) else "divergente", "igual")
+registar("B6d", "sem newline final contra com newline final",
+         "igual" if so_lf(_BASE.rstrip("\n")) == so_lf(_BASE) else "divergente", "igual")
+registar("B6e", "misto CRLF/LF/CR contra LF",
+         "igual" if so_lf("linha um\r\nlinha dois\rlinha tres\n") == so_lf(_BASE)
+         else "divergente", "igual")
+registar("B6f", "MUTACAO de conteudo continua a reprovar",
+         "igual" if so_lf(_BASE.replace("dois", "DOIS")) == so_lf(_BASE) else "divergente",
+         "divergente")
+registar("B6g", "linha reordenada continua a reprovar",
+         "igual" if so_lf("linha dois\nlinha um\nlinha tres\n") == so_lf(_BASE)
+         else "divergente", "divergente")
+registar("B6h", "espaco a mais continua a reprovar",
+         "igual" if so_lf("linha um \nlinha dois\nlinha tres\n") == so_lf(_BASE)
+         else "divergente", "divergente")
+registar("B6i", "linha em falta continua a reprovar",
+         "igual" if so_lf("linha um\nlinha tres\n") == so_lf(_BASE) else "divergente",
+         "divergente")
+# Normaliza ANTES de injectar: num checkout CRLF o ficheiro ja vem com \r\n, e
+# injectar outra vez daria \r\r\n -- que nao e' fim de linha nenhum, e' conteudo
+# novo. Sem isto o caso reprovava por uma razao que nao tem que ver com o que
+# ele existe para provar.
+registar("B6j", "o verify.py real, com CRLF injectado, continua igual",
+         "igual" if so_lf(so_lf(FONTE_VERIFY).replace("\n", "\r\n")) == so_lf(FONTE_VERIFY)
+         else "divergente", "igual")
+registar("B6k", "o verify.py real, com um byte trocado, reprova",
+         "igual" if so_lf(FONTE_VERIFY.replace("VERIFIED", "VERIFIEX", 1)) == so_lf(FONTE_VERIFY)
+         else "divergente", "divergente")
+
 _passo = GATE.split("Materialise the embedded verifier")[1].split("- name:")[0]
 _comandos = re.sub(r"<<'FIM_DO_VERIFICADOR'.*?FIM_DO_VERIFICADOR", "", _passo, flags=re.S)
 registar("B7", "os comandos que embutem nao leem o token nem claims",
